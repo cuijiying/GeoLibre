@@ -8,7 +8,9 @@ import os
 import re
 import secrets
 import shutil
+import time
 import uuid
+from collections import defaultdict, deque
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Annotated, Literal
@@ -64,6 +66,9 @@ class Account(Base):
     id: Mapped[str] = mapped_column(String(36), primary_key=True)
     username: Mapped[str | None] = mapped_column(String(39), unique=True, nullable=True)
     password_hash: Mapped[str] = mapped_column(Text)
+    # SaaS subscription tier ("free", "pro", ...). Drives the per-plan project
+    # quota enforced in create_project; billing sync updates it out of band.
+    plan: Mapped[str] = mapped_column(String(20), default="free")
     created_at: Mapped[str] = mapped_column(String(32))
     projects: Mapped[list[Project]] = relationship(
         back_populates="owner", cascade="all, delete-orphan"
@@ -77,6 +82,10 @@ class Token(Base):
         ForeignKey("accounts.id", ondelete="CASCADE"), index=True
     )
     created_at: Mapped[str] = mapped_column(String(32))
+    # ISO timestamp after which the token is rejected; None means it never
+    # expires (GEOLIBRE_TOKEN_TTL_DAYS=0). Nullable so tokens minted before the
+    # column existed keep their previous, non-expiring behavior.
+    expires_at: Mapped[str | None] = mapped_column(String(32), nullable=True)
 
 
 class Project(Base):
@@ -288,6 +297,64 @@ def token_digest(token: str) -> str:
     return hashlib.sha256(token.encode()).hexdigest()
 
 
+class RateLimiter:
+    """In-memory sliding-window limiter for the unauthenticated auth routes.
+
+    Per-process and best-effort: it blunts credential stuffing and registration
+    floods on the default single-process deployment. A multi-replica deployment
+    still needs a shared limiter at the proxy (the deployment notes already put
+    one there); this layer stays correct under concurrency because dict access
+    and deque append are atomic under the GIL, and a slightly stale count only
+    ever errs toward rejecting one extra request.
+    """
+
+    def __init__(self, max_attempts: int, window_seconds: int):
+        self.max_attempts = max_attempts
+        self.window_seconds = window_seconds
+        self._hits: dict[str, deque[float]] = defaultdict(deque)
+
+    def check(self, key: str) -> int:
+        """Record an attempt; return the Retry-After seconds, or 0 if allowed."""
+        if self.max_attempts <= 0:
+            return 0
+        now = time.monotonic()
+        hits = self._hits[key]
+        cutoff = now - self.window_seconds
+        while hits and hits[0] < cutoff:
+            hits.popleft()
+        if len(hits) >= self.max_attempts:
+            return max(1, int(hits[0] + self.window_seconds - now))
+        hits.append(now)
+        return 0
+
+
+def ensure_schema_columns(engine) -> None:
+    """Add columns introduced after an existing deployment's tables were created.
+
+    ``create_all`` never alters existing tables, so an upgraded server would
+    otherwise crash on the first read of ``accounts.plan`` or
+    ``tokens.expires_at``. Only additive, nullable/defaulted columns are
+    handled here; anything destructive belongs in a real migration tool.
+    """
+    from sqlalchemy import inspect, text
+
+    additions = {
+        "accounts": {"plan": String(20)},
+        "tokens": {"expires_at": String(32)},
+    }
+    with engine.begin() as connection:
+        inspector = inspect(connection)
+        for table, columns in additions.items():
+            if table not in inspector.get_table_names():
+                continue
+            existing = {column["name"] for column in inspector.get_columns(table)}
+            for name, column_type in columns.items():
+                if name in existing:
+                    continue
+                compiled = column_type.compile(dialect=engine.dialect)
+                connection.execute(text(f'ALTER TABLE "{table}" ADD COLUMN "{name}" {compiled}'))
+
+
 class FileStorage:
     def __init__(self, root: str):
         self.root = Path(root).resolve()
@@ -397,12 +464,23 @@ def create_app(
             dbapi_connection.execute("PRAGMA foreign_keys=ON")
 
     Base.metadata.create_all(engine)
+    ensure_schema_columns(engine)
     sessions = sessionmaker(engine, expire_on_commit=False)
     object_storage = storage or make_storage()
     base_url = (public_url or os.getenv("GEOLIBRE_PUBLIC_URL", "http://localhost:8000")).rstrip("/")
     viewer_url = os.getenv("GEOLIBRE_VIEWER_URL", "https://app.geolibre.org/").rstrip("/") + "/"
     max_project_bytes = int(os.getenv("GEOLIBRE_MAX_PROJECT_BYTES", str(50 * 1024 * 1024)))
     max_thumbnail_bytes = int(os.getenv("GEOLIBRE_MAX_THUMBNAIL_BYTES", str(5 * 1024 * 1024)))
+    # SaaS knobs. Token TTL of 0 keeps the pre-SaaS behavior (tokens never
+    # expire). Plan limits of 0 mean unlimited.
+    token_ttl_days = int(os.getenv("GEOLIBRE_TOKEN_TTL_DAYS", "30"))
+    plan_project_limits = {
+        "free": int(os.getenv("GEOLIBRE_FREE_PROJECT_LIMIT", "20")),
+        "pro": int(os.getenv("GEOLIBRE_PRO_PROJECT_LIMIT", "500")),
+    }
+    auth_rate_limit = int(os.getenv("GEOLIBRE_AUTH_RATE_LIMIT", "10"))
+    auth_rate_window = int(os.getenv("GEOLIBRE_AUTH_RATE_WINDOW_SECONDS", "60"))
+    auth_limiter = RateLimiter(auth_rate_limit, auth_rate_window)
 
     app = FastAPI(title="GeoLibre projects and identity API", version="1.0")
     app.state.engine = engine
@@ -487,6 +565,12 @@ def create_app(
         row = session.get(Token, token_digest(authorization[7:]))
         if row is None:
             raise HTTPException(401, "invalid or expired token")
+        if row.expires_at is not None and row.expires_at <= now():
+            # Treat expiry exactly like a token that was never issued, and reap
+            # the row so the table does not accumulate dead tokens.
+            session.delete(row)
+            session.commit()
+            raise HTTPException(401, "invalid or expired token")
         return session.get(Account, row.account_id)
 
     def required_account(account: Account | None = Depends(optional_account)) -> Account:
@@ -495,13 +579,64 @@ def create_app(
         return account
 
     def account_json(account: Account) -> dict:
-        return {"id": account.id, "username": account.username, "createdAt": account.created_at}
+        return {
+            "id": account.id,
+            "username": account.username,
+            "plan": account.plan or "free",
+            "createdAt": account.created_at,
+        }
+
+    def account_usage_json(session: Session, account: Account) -> dict:
+        """Account payload plus the quota usage a settings/billing page shows."""
+        project_count = session.scalar(
+            select(func.count()).select_from(Project).where(Project.owner_id == account.id)
+        )
+        plan = account.plan or "free"
+        limit = plan_project_limits.get(plan, 0)
+        return {
+            **account_json(account),
+            "projectCount": project_count,
+            # 0 means unlimited; surfaced as null so clients do not render "0/0".
+            "projectLimit": limit if limit > 0 else None,
+        }
 
     def issue_token(session: Session, account: Account) -> str:
         value = secrets.token_urlsafe(32)
-        session.add(Token(digest=token_digest(value), account_id=account.id, created_at=now()))
+        expires_at = None
+        if token_ttl_days > 0:
+            expires_at = (
+                (datetime.now(UTC) + timedelta(days=token_ttl_days))
+                .isoformat()
+                .replace("+00:00", "Z")
+            )
+            # Reap this account's dead tokens while we are here, so the table
+            # stays bounded without a background sweeper.
+            session.execute(
+                delete(Token).where(
+                    Token.account_id == account.id, Token.expires_at <= now()
+                )
+            )
+        session.add(
+            Token(
+                digest=token_digest(value),
+                account_id=account.id,
+                created_at=now(),
+                expires_at=expires_at,
+            )
+        )
         session.commit()
         return value
+
+    def check_auth_rate_limit(request: Request) -> None:
+        """429 brute-force protection for the two unauthenticated auth routes."""
+        client_host = request.client.host if request.client else "unknown"
+        retry_after = auth_limiter.check(f"{request.url.path}:{client_host}")
+        if retry_after:
+            raise HTTPException(
+                429,
+                "too many attempts; retry later",
+                headers={"Retry-After": str(retry_after)},
+            )
 
     def unique_slug(session: Session, owner_id: str, desired: str) -> str:
         base = slugify(desired)
@@ -566,6 +701,21 @@ def create_app(
     ) -> Project:
         if not account.username:
             raise HTTPException(400, "username required")
+        plan = account.plan or "free"
+        limit = plan_project_limits.get(plan, 0)
+        if limit > 0:
+            project_count = session.scalar(
+                select(func.count()).select_from(Project).where(Project.owner_id == account.id)
+            )
+            if (project_count or 0) >= limit:
+                # 402 would mislead (no payment flow is wired here); 403 with a
+                # plan-specific message tells the client exactly why and what
+                # to do, and forks hit the same guard as fresh uploads.
+                raise HTTPException(
+                    403,
+                    f"project limit reached for the {plan} plan ({limit}); "
+                    "delete projects or upgrade the plan",
+                )
         document = parse_content(content, max_project_bytes)
         title = title_from(document, filename)
         timestamp = now()
@@ -608,7 +758,10 @@ def create_app(
         return project
 
     @app.post("/api/accounts", status_code=201)
-    def create_account(body: Credentials, session: Session = Depends(db)):
+    def create_account(
+        body: Credentials, request: Request, session: Session = Depends(db)
+    ):
+        check_auth_rate_limit(request)
         username = body.username.strip()
         if not USERNAME_RE.fullmatch(username):
             raise HTTPException(422, "username must be 3-39 lowercase letters, digits, or hyphens")
@@ -636,7 +789,8 @@ def create_app(
         return {"account": account_json(account), "token": issue_token(session, account)}
 
     @app.post("/api/auth/token")
-    def login(body: Credentials, session: Session = Depends(db)):
+    def login(body: Credentials, request: Request, session: Session = Depends(db)):
+        check_auth_rate_limit(request)
         account = session.scalar(select(Account).where(Account.username == body.username))
         if account is None:
             # Hash anyway before failing. Short-circuiting here would skip the
@@ -660,14 +814,15 @@ def create_app(
         session.commit()
 
     @app.get("/api/account")
-    def get_account(account: Account = Depends(required_account)):
-        return {"account": account_json(account)}
+    def get_account(account: Account = Depends(required_account), session: Session = Depends(db)):
+        return {"account": account_usage_json(session, account)}
 
     @app.get("/api/users/me")
-    def get_current_user(account: Account = Depends(required_account)):
-        # The full account shape, matching what docs/server-api.md publishes and
-        # what /api/account returns. The gallery client reads only `username`.
-        return {"user": account_json(account)}
+    def get_current_user(account: Account = Depends(required_account), session: Session = Depends(db)):
+        # The full account shape plus quota usage, matching what
+        # docs/server-api.md publishes and what /api/account returns. The
+        # gallery client reads only `username`.
+        return {"user": account_usage_json(session, account)}
 
     @app.get("/api/users/{username}/projects")
     def get_user_projects(

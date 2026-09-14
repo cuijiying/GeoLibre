@@ -362,3 +362,132 @@ def test_anonymous_bucket_insert_race_falls_back_to_increment(client):
         ).all()
     assert len(rows) == 1
     assert rows[0].count == 2
+
+
+def saas_client(tmp_path, monkeypatch, env, db_name="saas.db"):
+    """Build a client with SaaS env knobs set, mirroring the `client` fixture."""
+    for key, value in env.items():
+        monkeypatch.setenv(key, value)
+    app = create_app(
+        f"sqlite:///{tmp_path / db_name}",
+        public_url="https://share.example",
+        storage=FileStorage(str(tmp_path / "objects")),
+    )
+    return TestClient(app)
+
+
+def test_token_expiry_rejects_and_reaps_expired_tokens(tmp_path, monkeypatch):
+    with saas_client(tmp_path, monkeypatch, {"GEOLIBRE_TOKEN_TTL_DAYS": "30"}) as client:
+        token = account(client)
+        # A TTL'd token records an expiry; pre-TTL tokens (expires_at NULL) are
+        # grandfathered and never expire. engine.begin() commits on exit — the
+        # expiry rewrite below must actually land before the next request.
+        with client.app.state.engine.begin() as connection:
+            expires = connection.exec_driver_sql("select expires_at from tokens").scalar()
+            assert expires is not None
+            connection.exec_driver_sql("update tokens set expires_at = '2000-01-01T00:00:00Z'")
+        assert client.get("/api/account", headers=auth(token)).status_code == 401
+        # The expired row is reaped on the way out, not left to accumulate.
+        with client.app.state.engine.connect() as connection:
+            assert connection.exec_driver_sql("select count(*) from tokens").scalar() == 0
+        # A fresh login still works and mints a new token.
+        login = client.post("/api/auth/token", json={"username": "ada", "password": "correct horse"})
+        assert login.status_code == 200
+
+
+def test_token_ttl_zero_keeps_non_expiring_tokens(tmp_path, monkeypatch):
+    with saas_client(
+        tmp_path, monkeypatch, {"GEOLIBRE_TOKEN_TTL_DAYS": "0"}, "nottl.db"
+    ) as client:
+        token = account(client)
+        with client.app.state.engine.connect() as connection:
+            assert connection.exec_driver_sql("select expires_at from tokens").scalar() is None
+        assert client.get("/api/account", headers=auth(token)).status_code == 200
+
+
+def test_auth_routes_are_rate_limited(tmp_path, monkeypatch):
+    with saas_client(
+        tmp_path, monkeypatch, {"GEOLIBRE_AUTH_RATE_LIMIT": "3"}, "ratelimit.db"
+    ) as client:
+        body = {"username": "ada", "password": "correct horse"}
+        for _ in range(3):
+            assert client.post("/api/auth/token", json=body).status_code == 401
+        blocked = client.post("/api/auth/token", json=body)
+        assert blocked.status_code == 429
+        assert blocked.json()["error"]
+        assert int(blocked.headers["Retry-After"]) >= 1
+        # The limiter keys on path, so registration is a separate bucket.
+        assert client.post("/api/accounts", json=body).status_code == 201
+
+
+def test_plan_quota_enforced_and_usage_reported(tmp_path, monkeypatch):
+    env = {"GEOLIBRE_FREE_PROJECT_LIMIT": "2", "GEOLIBRE_PRO_PROJECT_LIMIT": "4"}
+    with saas_client(tmp_path, monkeypatch, env, "quota.db") as client:
+        token = account(client)
+        create_project(client, token, title="One")
+        create_project(client, token, title="Two")
+        content = json.dumps({"version": "1.0", "title": "Three", "layers": []})
+        over = client.post(
+            "/api/projects",
+            headers=auth(token),
+            json={"filename": "three.geolibre.json", "content": content, "visibility": "public"},
+        )
+        assert over.status_code == 403
+        assert "free" in over.json()["error"]
+
+        usage = client.get("/api/account", headers=auth(token)).json()["account"]
+        assert usage["plan"] == "free"
+        assert usage["projectCount"] == 2
+        assert usage["projectLimit"] == 2
+
+        # Upgrading the plan (billing sync writes the column directly) lifts
+        # the same request over the line. begin() so the UPDATE commits.
+        with client.app.state.engine.begin() as connection:
+            connection.exec_driver_sql("update accounts set plan = 'pro'")
+        ok = client.post(
+            "/api/projects",
+            headers=auth(token),
+            json={"filename": "three.geolibre.json", "content": content, "visibility": "public"},
+        )
+        assert ok.status_code == 201, ok.text
+        usage = client.get("/api/users/me", headers=auth(token)).json()["user"]
+        assert usage["plan"] == "pro"
+        assert usage["projectLimit"] == 4
+
+
+def test_ensure_schema_columns_upgrades_pre_saas_databases(tmp_path, monkeypatch):
+    """A database created before the plan/expires_at columns existed gains them."""
+    import sqlalchemy
+
+    db_path = tmp_path / "legacy.db"
+    engine = sqlalchemy.create_engine(f"sqlite:///{db_path}")
+    with engine.begin() as connection:
+        connection.exec_driver_sql(
+            "create table accounts (id varchar(36) primary key, username varchar(39), "
+            "password_hash text, created_at varchar(32))"
+        )
+        connection.exec_driver_sql(
+            "insert into accounts values ('a1', 'ada', 'x', '2026-01-01T00:00:00Z')"
+        )
+        connection.exec_driver_sql(
+            "create table tokens (digest varchar(64) primary key, account_id varchar(36), "
+            "created_at varchar(32))"
+        )
+    engine.dispose()
+
+    monkeypatch.setenv("GEOLIBRE_TOKEN_TTL_DAYS", "30")
+    app = create_app(
+        f"sqlite:///{db_path}",
+        public_url="https://share.example",
+        storage=FileStorage(str(tmp_path / "objects")),
+    )
+    with TestClient(app):
+        with app.state.engine.connect() as connection:
+            plan = connection.exec_driver_sql("select plan from accounts where id = 'a1'").scalar()
+            expires = connection.exec_driver_sql(
+                "select expires_at from tokens limit 1"
+            ).scalar()
+        # Existing rows keep working: plan reads back as the ORM default's
+        # absence (NULL -> "free" in the API), and old tokens never expire.
+        assert plan is None
+        assert expires is None

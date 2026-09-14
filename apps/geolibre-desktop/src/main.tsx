@@ -199,6 +199,13 @@ function loadAuthGate(
       </ClerkGate>
     ));
   }
+  if (config.provider === "native") {
+    return import("./components/auth/NativeGate").then(({ NativeGate }) => (children: ReactNode) => (
+      <NativeGate apiUrl={config.apiUrl} brandName={config.brandName}>
+        {children}
+      </NativeGate>
+    ));
+  }
   return import("./components/auth/Auth0Gate").then(({ Auth0Gate }) => (children: ReactNode) => (
     <Auth0Gate domain={config.domain} clientId={config.clientId}>
       {children}

@@ -6,11 +6,13 @@ import {
   resolveClerkWaitlistEnabled,
 } from "./clerk-auth";
 import { readDeploymentEnv, readDeploymentEnvValue, type EnvRecord } from "./deployment-env";
+import { resolveBrandName, resolveNativeAuthUrl } from "./native-auth";
 
 /** Which optional sign-in gate a hosted deployment has configured, if any. */
 export type AuthGateConfig =
   | { provider: "clerk"; publishableKey: string; waitlist: boolean }
-  | { provider: "auth0"; domain: string; clientId: string };
+  | { provider: "auth0"; domain: string; clientId: string }
+  | { provider: "native"; apiUrl: string; brandName: string };
 
 /**
  * Pick the sign-in gate for a web deployment.
@@ -42,6 +44,7 @@ export function resolveAuthGate(
 
   const clerkKey = resolveClerkPublishableKey(true, deployment, build);
   const auth0 = resolveAuth0Config(true, deployment, build);
+  const nativeUrl = resolveNativeAuthUrl(true, deployment, build);
 
   const clerk = (): AuthGateConfig => ({
     provider: "clerk",
@@ -50,6 +53,19 @@ export function resolveAuthGate(
     // key can still have its waitlist screen turned on at runtime.
     waitlist: resolveClerkWaitlistEnabled(true, deployment, build),
   });
+
+  const native = (): AuthGateConfig => ({
+    provider: "native",
+    apiUrl: nativeUrl!,
+    brandName: resolveBrandName(deployment, build),
+  });
+
+  // Native is the self-hosted fallback: it only ever wins when neither hosted
+  // provider resolved, so an operator cannot accidentally replace a Clerk or
+  // Auth0 gate (which enforce MFA/social policies server-side) with the
+  // username/password form by adding one variable. Running native alongside a
+  // hosted provider is refused at container startup anyway (entrypoint.sh).
+  if (!clerkKey && !auth0 && nativeUrl) return native();
 
   if (clerkKey && auth0) {
     // Raw presence, not a full resolve: this only asks which tier *named* the

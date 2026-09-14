@@ -92,7 +92,7 @@ Response `201`:
 
 ```json
 {
-  "account": {"id": "uuid", "username": "ada", "createdAt": "2026-08-03T12:00:00Z"},
+  "account": {"id": "uuid", "username": "ada", "plan": "free", "createdAt": "2026-08-03T12:00:00Z"},
   "token": "secret-token"
 }
 ```
@@ -106,7 +106,13 @@ Exchanges account credentials for a personal API token.
 ```
 
 Response `200` has the same shape as account creation. Tokens are opaque and
-must be stored hashed by the server.
+must be stored hashed by the server. A server may expire tokens
+(`GEOLIBRE_TOKEN_TTL_DAYS`); an expired token is indistinguishable from an
+invalid one (`401`).
+
+Both unauthenticated auth routes may answer `429` with a `Retry-After` header
+when the caller exceeds the server's attempt budget; clients must back off
+rather than retry immediately.
 
 ### `DELETE /api/auth/token`
 
@@ -114,11 +120,15 @@ Revokes the presented Bearer token. Response: `204`.
 
 ### `GET /api/users/me`
 
-Returns the account associated with the token:
+Returns the account associated with the token, including the subscription plan
+and project quota usage (`projectLimit` is `null` when the plan is unlimited):
 
 ```json
-{"user": {"id": "uuid", "username": "ada", "createdAt": "2026-08-03T12:00:00Z"}}
+{"user": {"id": "uuid", "username": "ada", "plan": "free", "createdAt": "2026-08-03T12:00:00Z", "projectCount": 7, "projectLimit": 20}}
 ```
+
+Creating or forking a project past the plan's limit fails with `403` and an
+error naming the plan and its limit.
 
 An identity provider may create accounts without a username. Project creation
 for such an account must return `400` with an error containing the stable,

@@ -13,11 +13,17 @@ services:
       # them with the public TLS origins when deploying behind an ingress.
       GEOLIBRE_SHARE_URL: "${GEOLIBRE_SHARE_URL:-http://localhost:8000}"
       GEOLIBRE_COLLAB_URL: "${GEOLIBRE_COLLAB_URL:-ws://localhost:8787}"
-      # Optional sign-in gate: configure either Clerk or Auth0, not both.
+      # Optional sign-in gate: configure at most one of Clerk, Auth0, or the
+      # native (self-hosted) gate. The native gate authenticates against the
+      # geolibre-server account system below — the default for a self-operated
+      # SaaS. GEOLIBRE_NATIVE_AUTH_URL is the browser-reachable API origin,
+      # GEOLIBRE_BRAND_NAME the product name on the sign-in screen.
       GEOLIBRE_CLERK_PUBLISHABLE_KEY: "${GEOLIBRE_CLERK_PUBLISHABLE_KEY:-}"
       GEOLIBRE_CLERK_WAITLIST: "${GEOLIBRE_CLERK_WAITLIST:-}"
       GEOLIBRE_AUTH0_DOMAIN: "${GEOLIBRE_AUTH0_DOMAIN:-}"
       GEOLIBRE_AUTH0_CLIENT_ID: "${GEOLIBRE_AUTH0_CLIENT_ID:-}"
+      GEOLIBRE_NATIVE_AUTH_URL: "${GEOLIBRE_NATIVE_AUTH_URL:-}"
+      GEOLIBRE_BRAND_NAME: "${GEOLIBRE_BRAND_NAME:-}"
     depends_on:
       geolibre-server:
         condition: service_healthy
@@ -44,6 +50,13 @@ services:
       GEOLIBRE_PUBLIC_URL: "${GEOLIBRE_SHARE_URL:-http://localhost:8000}"
       GEOLIBRE_VIEWER_URL: "${GEOLIBRE_VIEWER_URL:-http://localhost:8080}"
       GEOLIBRE_CORS_ORIGINS: "${GEOLIBRE_CORS_ORIGINS:-http://localhost:8080}"
+      # SaaS account knobs: session token lifetime in days (0 = never expires),
+      # per-plan project quotas (0 = unlimited), and auth-route rate limiting.
+      GEOLIBRE_TOKEN_TTL_DAYS: "${GEOLIBRE_TOKEN_TTL_DAYS:-30}"
+      GEOLIBRE_FREE_PROJECT_LIMIT: "${GEOLIBRE_FREE_PROJECT_LIMIT:-20}"
+      GEOLIBRE_PRO_PROJECT_LIMIT: "${GEOLIBRE_PRO_PROJECT_LIMIT:-500}"
+      GEOLIBRE_AUTH_RATE_LIMIT: "${GEOLIBRE_AUTH_RATE_LIMIT:-10}"
+      GEOLIBRE_AUTH_RATE_WINDOW_SECONDS: "${GEOLIBRE_AUTH_RATE_WINDOW_SECONDS:-60}"
     volumes:
       - geolibre-projects:/data/objects
     depends_on:

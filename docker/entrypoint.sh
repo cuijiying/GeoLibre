@@ -366,6 +366,35 @@ if collab_url:
         "GEOLIBRE_COLLAB_URL", collab_url, ("wss",), ("ws",), ("localhost", "127.0.0.1", "::1")
     )
 
+# Optional native (self-hosted) sign-in gate: the app authenticates against
+# the geolibre_server_api account system the operator runs, instead of a hosted
+# identity provider. Mutually exclusive with Clerk and Auth0 for the same
+# reason they are with each other: one deployment, one gate, decided at boot
+# rather than by precedence rules nobody can see.
+native_auth_url = os.environ.get("GEOLIBRE_NATIVE_AUTH_URL", "").strip()
+if native_auth_url:
+    if clerk_key or auth0_domain or auth0_client_id:
+        raise SystemExit(
+            "ERROR: configure only one sign-in gate. Unset GEOLIBRE_CLERK_PUBLISHABLE_KEY "
+            "and the GEOLIBRE_AUTH0_* variables, or unset GEOLIBRE_NATIVE_AUTH_URL."
+        )
+    deployment["VITE_GEOLIBRE_NATIVE_AUTH_URL"] = service_url(
+        "GEOLIBRE_NATIVE_AUTH_URL",
+        native_auth_url,
+        ("https",),
+        ("http",),
+        ("localhost", "127.0.0.1", "::1"),
+    )
+
+# Optional product name for the sign-in screen of the native gate. JSON-encoded
+# below like every other value, so any printable text is safe; only length and
+# control characters are bounded.
+brand_name = os.environ.get("GEOLIBRE_BRAND_NAME", "").strip()
+if brand_name:
+    if len(brand_name) > 80 or any(ord(c) < 32 for c in brand_name):
+        raise SystemExit("ERROR: GEOLIBRE_BRAND_NAME must be at most 80 printable characters.")
+    deployment["VITE_GEOLIBRE_BRAND_NAME"] = brand_name
+
 with open("/usr/share/nginx/html/geolibre-runtime-config.js", "w") as output:
     output.write("window.__GEOLIBRE_DEPLOYMENT_ENV__ = ")
     json.dump(deployment, output, separators=(",", ":"))
@@ -431,6 +460,14 @@ if [ -n "$(trim "${GEOLIBRE_AUTH0_DOMAIN:-}")" ]; then
     tr '[:upper:]' '[:lower:]' |
     sed -e 's#^http://##' -e 's#^https://##' |
     cut -d/ -f1)."
+fi
+
+if [ -n "$(trim "${GEOLIBRE_NATIVE_AUTH_URL:-}")" ]; then
+  echo "Native sign-in gate enabled against $(trim "$GEOLIBRE_NATIVE_AUTH_URL")."
+fi
+
+if [ -n "$(trim "${GEOLIBRE_BRAND_NAME:-}")" ]; then
+  echo "Brand name: $(trim "$GEOLIBRE_BRAND_NAME")"
 fi
 
 # Render the nginx config from the immutable image template on every boot. The
